@@ -1,0 +1,111 @@
+
+hashfunction H;
+hashfunction ECC;
+
+const xor: Function;
+const con: Function;
+
+usertype Timestamp;
+
+const P;
+
+protocol Improved(device, fog)
+{
+
+secret Af;
+secret Ad;
+secret Bk;
+
+const Tidd;
+const Tidf;
+
+macro Ed = xor(rd, H(con(con(Bk, Af), Td)));
+macro I = ECC(re, P);
+macro TidNewd = H(xor(Tidd, rd));
+macro Gd = H(con(con(con(con(Ad, TidNewd), Bk), Td), I));
+
+macro rdstar = xor(Ed, H(con(con(Bk, Af), Td)));
+macro TidNewdstar = H(xor(Tidd, rdstar));
+macro Gdstar = H(con(con(con(con(Ad, TidNewdstar), Bk), Td), I));
+
+macro J = ECC(rg, P);
+macro Ef = xor(rf, H(con(TidNewdstar, Bk)));
+macro TidNewf = H(xor(Tidf, rf));
+
+macro rfstar = xor(Ef, H(con(TidNewd, Bk)));
+macro TidNewfstar = H(xor(Tidf, rfstar));
+
+macro Sk = H(con(con(con(con(I, rg), rdstar), rf), con(Tf, Bk)));
+macro Skstar = H(con(con(con(con(J, re), rd), rfstar), con(Tf, Bk)));
+
+macro Gf = H(con(con(con(con(con(TidNewf, Bk), rf), Sk), Tf), Ef));
+macro Gfstar = H(con(con(con(con(con(TidNewfstar, Bk), rfstar), Skstar), Tf), Ef));
+
+macro Ack = H(con(con(rfstar, Bk), Skstar));
+macro Ackf = H(con(con(rf, Bk), Sk));
+
+role device
+{
+
+fresh rd: Nonce;
+fresh re: Nonce;
+fresh Td: Timestamp;
+
+var rf: Nonce;
+var rg: Nonce;
+var Tf: Timestamp;
+
+var Ef;
+var Gf;
+
+send_1(device, fog, Tidd, Td, Ed, Gd, I);
+
+recv_2(fog, device, Tidf, Tf, Ef, Gf, J);
+
+match(Gf, Gfstar);
+
+send_3(device, fog, Ack);
+
+claim_device(device, Secret, rd);
+claim_device(device, Secret, re);
+claim_device(device, Alive);
+claim_device(device, Weakagree);
+claim_device(device, Nisynch);
+
+}
+
+role fog
+{
+
+var rd: Nonce;
+var re: Nonce;
+var Td: Timestamp;
+
+fresh rf: Nonce;
+fresh rg: Nonce;
+fresh Tf: Timestamp;
+
+var Ed;
+var Gd;
+var I;
+
+recv_1(device, fog, Tidd, Td, Ed, Gd, I);
+
+match(Gd, Gdstar);
+
+send_2(fog, device, Tidf, Tf, Ef, Gf, J);
+
+recv_3(device, fog, Ack);
+
+match(Ack, Ackf);
+
+claim_fog(fog, Secret, rf);
+claim_fog(fog, Secret, rg);
+claim_fog(fog, Alive);
+claim_fog(fog, Weakagree);
+claim_fog(fog, Nisynch);
+
+}
+
+}
+
