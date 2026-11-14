@@ -1,691 +1,328 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Benchmark the exact current RMLA Laboratory v4 implementation.
 
-"""
-RMLA EXECUTION-TIME BENCHMARK
-
-Files:
-    rmla_benchmark.py
-    rmla_lab.py
-
+Keep this file beside RMLA_Laboratory_v4_paper_aligned.py.
 Run:
-    python rmla_benchmark.py
+    python RMLA_Benchmark_v4_paper_aligned.py
+    python RMLA_Benchmark_v4_paper_aligned.py --warmup 20 --sessions 1000
+    python RMLA_Benchmark_v4_paper_aligned.py --sessions 1000 --csv rmla_v4_results.csv
 
-Optional:
-    python rmla_benchmark.py --warmup 20 --sessions 1000
-
-CSV:
-    python rmla_benchmark.py --warmup 20 --sessions 1000 --csv rmla_results.csv
+The prototype is imported directly; protocol equations/steps are not reimplemented.
+Overall session timings are collected without instrumentation. A separate
+profile run counts actual H(), _scalar_mult(), and xor_bytes() calls; its
+instrumentation overhead is excluded from the reported timing statistics.
 """
 
 import argparse
 import csv
+import importlib.util
 import statistics
 import sys
 import time
+from pathlib import Path
 
-try:
-    from rmla_lab import RMLADatabase, Lab
-except ImportError as exc:
-    raise SystemExit(
-        "\nERROR: Cannot import the RMLA prototype.\n"
-        "Make sure rmla_lab.py is in the same directory as this file.\n"
-    ) from exc
-
-
-# ================================================================
-# CONFIGURATION
-# ================================================================
-
+DEFAULT_PROTOTYPE = "RMLA_Laboratory_v4_paper_aligned.py"
 DEFAULT_WARMUP = 20
 DEFAULT_SESSIONS = 1000
-
 DEFAULT_FOG_ID = "FOG-001"
 DEFAULT_DEVICE_ID = "DEVICE-001"
 
 
-# ================================================================
-# HELPER FUNCTIONS
-# ================================================================
+def load_prototype(path):
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Prototype file not found: {path}")
+    spec = importlib.util.spec_from_file_location("rmla_v4_prototype", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load prototype module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module, path
 
-def quiet_log(*args, **kwargs):
-    """
-    Suppress prototype logs during benchmark execution.
-    GUI output is not included in measurements.
-    """
-    pass
 
-
-def nanoseconds_to_ms(value):
-    """Convert nanoseconds to milliseconds."""
+def ns_to_ms(value):
     return value / 1_000_000.0
 
 
-def calculate_statistics(samples):
-
+def summarize(samples):
     return {
         "mean": statistics.mean(samples),
-        "std": (
-            statistics.stdev(samples)
-            if len(samples) > 1
-            else 0.0
-        ),
+        "std": statistics.stdev(samples) if len(samples) > 1 else 0.0,
         "median": statistics.median(samples),
         "min": min(samples),
         "max": max(samples),
     }
 
 
-def verify_session(result, session_number):
-
-    if not isinstance(result, dict):
+def assert_success(result, lab, device_id, label):
+    required = (
+        result.get("acked")
+        and result.get("device_authenticated")
+        and result.get("fog_authenticated")
+        and result.get("device_sk") is not None
+        and result.get("device_sk") == result.get("fog_sk")
+        and lab.sync_status(device_id) == "SYNC"
+    )
+    if not required:
         raise RuntimeError(
-            f"Session {session_number}: unexpected result format."
+            f"{label} did not complete correctly: result={result}; "
+            f"sync={lab.sync_status(device_id)}"
         )
 
-    if not result.get("acked"):
-        raise RuntimeError(
-            f"Session {session_number}: protocol session failed. "
-            f"Details: {result}"
-        )
 
-    device_sk = result.get("device_sk")
-    fog_sk = result.get("fog_sk")
-
-    if device_sk is None or fog_sk is None:
-        raise RuntimeError(
-            f"Session {session_number}: session key is missing."
-        )
-
-    if device_sk != fog_sk:
-        raise RuntimeError(
-            f"Session {session_number}: session keys do not match."
-        )
-
-    return True
+def make_lab(m):
+    db = m.RMLADatabase(None)  # Same in-memory SQLite backend as the prototype.
+    lab = m.Lab(db, lambda *_args, **_kwargs: None)
+    return db, lab
 
 
-# ================================================================
-# CSV EXPORT
-# ================================================================
+def inspect_registered_sizes(m, lab, fog_id, device_id):
+    db = lab.db
+    d = db.conn.execute(
+        "SELECT * FROM device_node WHERE device_id=?", (device_id,)
+    ).fetchone()
+    f = db.conn.execute(
+        "SELECT * FROM fog_devices WHERE fog_id=? AND a_d=?",
+        (fog_id, d["a_d"]),
+    ).fetchone()
+    if d is None or f is None:
+        raise RuntimeError("Could not inspect registered device/fog records.")
 
-def export_csv(
-    csv_path,
-    initialization_ms,
-    fog_registration_ms,
-    device_registration_ms,
-    total_registration_ms,
-    stats,
-    complete_workflow_ms,
-    successful_sessions,
-    key_agreement_count,
-    synchronization_count,
-    samples
-):
-
-    with open(
-        csv_path,
-        mode="w",
-        newline="",
-        encoding="utf-8-sig"
-    ) as file:
-
-        writer = csv.writer(file)
-
-        writer.writerow(["Metric", "Value", "Unit"])
-
-        writer.writerow([
-            "System Initialization",
-            initialization_ms,
-            "ms"
-        ])
-
-        writer.writerow([
-            "Fog Registration",
-            fog_registration_ms,
-            "ms"
-        ])
-
-        writer.writerow([
-            "Device Registration",
-            device_registration_ms,
-            "ms"
-        ])
-
-        writer.writerow([
-            "Total Registration",
-            total_registration_ms,
-            "ms"
-        ])
-
-        writer.writerow([
-            "Authentication Mean",
-            stats["mean"],
-            "ms"
-        ])
-
-        writer.writerow([
-            "Authentication Standard Deviation",
-            stats["std"],
-            "ms"
-        ])
-
-        writer.writerow([
-            "Authentication Median",
-            stats["median"],
-            "ms"
-        ])
-
-        writer.writerow([
-            "Authentication Minimum",
-            stats["min"],
-            "ms"
-        ])
-
-        writer.writerow([
-            "Authentication Maximum",
-            stats["max"],
-            "ms"
-        ])
-
-        writer.writerow([
-            "Complete Workflow",
-            complete_workflow_ms,
-            "ms"
-        ])
-
-        writer.writerow([
-            "Successful Sessions",
-            successful_sessions,
-            "sessions"
-        ])
-
-        writer.writerow([
-            "Session Key Agreements",
-            key_agreement_count,
-            "sessions"
-        ])
-
-        writer.writerow([
-            "Credential Synchronizations",
-            synchronization_count,
-            "sessions"
-        ])
-
-        writer.writerow([])
-
-        writer.writerow([
-            "Session Index",
-            "Authentication Time (ms)"
-        ])
-
-        for index, sample in enumerate(samples, start=1):
-
-            writer.writerow([
-                index,
-                sample
-            ])
+    sizes = {
+        "A_d": len(d["a_d"]),
+        "A_f": len(d["a_f"]),
+        "TID_d": len(d["tid_d"]),
+        "TID_f": len(d["tid_f"]),
+        "B_k_device": len(d["b_k"]),
+        "B_k_fog": len(f["b_k"]),
+    }
+    expected = {
+        "A_d": m.HASH_OUTPUT_BYTES,
+        "A_f": m.HASH_OUTPUT_BYTES,
+        "TID_d": m.HASH_OUTPUT_BYTES,
+        "TID_f": m.HASH_OUTPUT_BYTES,
+        "B_k_device": m.HASH_OUTPUT_BYTES,
+        "B_k_fog": m.HASH_OUTPUT_BYTES,
+    }
+    for name, expected_len in expected.items():
+        if sizes[name] != expected_len:
+            raise RuntimeError(
+                f"Parameter-size mismatch: {name} is {sizes[name]} bytes; "
+                f"expected {expected_len} bytes from the prototype constants."
+            )
+    return sizes
 
 
-# ================================================================
-# MAIN BENCHMARK
-# ================================================================
+def count_one_session_operations(m, fog_id, device_id):
+    """Count calls in a separate session; does not affect timing samples."""
+    db, lab = make_lab(m)
+    counts = {"hash_calls": 0, "scalar_mult_calls": 0, "xor_calls": 0}
+    original_h = m.H
+    original_scalar_mult = m._scalar_mult
+    original_xor = m.xor_bytes
 
-def run_benchmark(
-    warmup=DEFAULT_WARMUP,
-    sessions=DEFAULT_SESSIONS,
-    fog_id=DEFAULT_FOG_ID,
-    device_id=DEFAULT_DEVICE_ID,
-    csv_path=None
-):
+    def counted_h(*args):
+        counts["hash_calls"] += 1
+        return original_h(*args)
 
-    if warmup < 0:
-        raise ValueError(
-            "Warm-up sessions cannot be negative."
-        )
+    def counted_scalar_mult(*args, **kwargs):
+        counts["scalar_mult_calls"] += 1
+        return original_scalar_mult(*args, **kwargs)
 
-    if sessions < 1:
-        raise ValueError(
-            "Benchmark sessions must be at least 1."
-        )
-
-    # ------------------------------------------------------------
-    # DATABASE AND PROTOCOL INITIALIZATION
-    # ------------------------------------------------------------
-
-    db = RMLADatabase(None)
-    lab = Lab(db, quiet_log)
+    def counted_xor(*args, **kwargs):
+        counts["xor_calls"] += 1
+        return original_xor(*args, **kwargs)
 
     try:
-
-        # --------------------------------------------------------
-        # 1. SYSTEM INITIALIZATION
-        # --------------------------------------------------------
-
-        start = time.perf_counter_ns()
-
         lab.initialize()
-
-        initialization_ms = nanoseconds_to_ms(
-            time.perf_counter_ns() - start
-        )
-
-        # --------------------------------------------------------
-        # 2. FOG REGISTRATION
-        # --------------------------------------------------------
-
-        start = time.perf_counter_ns()
-
         lab.add_fog(fog_id)
-
-        fog_registration_ms = nanoseconds_to_ms(
-            time.perf_counter_ns() - start
-        )
-
-        # --------------------------------------------------------
-        # 3. DEVICE REGISTRATION
-        # --------------------------------------------------------
-
-        start = time.perf_counter_ns()
-
         lab.add_device(device_id, fog_id)
-
-        device_registration_ms = nanoseconds_to_ms(
-            time.perf_counter_ns() - start
-        )
-
-        total_registration_ms = (
-            fog_registration_ms
-            + device_registration_ms
-        )
-
-        # --------------------------------------------------------
-        # 4. WARM-UP
-        # --------------------------------------------------------
-
-        for i in range(warmup):
-
-            result = lab.session(
-                device_id,
-                verbose=False
-            )
-
-            verify_session(
-                result,
-                f"Warm-up {i + 1}"
-            )
-
-            if lab.sync_status(device_id) != "SYNC":
-
-                raise RuntimeError(
-                    f"Warm-up session {i + 1}: "
-                    "credential synchronization failed."
-                )
-
-        # --------------------------------------------------------
-        # 5. MEASURED SESSIONS
-        # --------------------------------------------------------
-
-        authentication_times = []
-
-        key_agreement_count = 0
-        synchronization_count = 0
-
-        for i in range(sessions):
-
-            start = time.perf_counter_ns()
-
-            result = lab.session(
-                device_id,
-                verbose=False
-            )
-
-            elapsed = time.perf_counter_ns() - start
-
-            # Validate the completed protocol execution.
-            verify_session(
-                result,
-                i + 1
-            )
-
-            authentication_times.append(
-                nanoseconds_to_ms(elapsed)
-            )
-
-            # Session-key agreement.
-            device_sk = result.get("device_sk")
-            fog_sk = result.get("fog_sk")
-
-            if (
-                device_sk is not None
-                and fog_sk is not None
-                and device_sk == fog_sk
-            ):
-
-                key_agreement_count += 1
-
-            # Credential synchronization.
-            if lab.sync_status(device_id) == "SYNC":
-
-                synchronization_count += 1
-
-        # --------------------------------------------------------
-        # 6. CALCULATE RESULTS
-        # --------------------------------------------------------
-
-        stats = calculate_statistics(
-            authentication_times
-        )
-
-        complete_workflow_ms = (
-            total_registration_ms
-            + stats["mean"]
-        )
-
-        final_sync = lab.sync_status(device_id)
-
-        successful_sessions = len(
-            authentication_times
-        )
-
-        # In this implementation, a completed ACKed session,
-        # matching session keys and successful synchronization
-        # are used together as the mutual-authentication check.
-        mutual_authentication_verified = (
-            successful_sessions == sessions
-            and key_agreement_count == sessions
-            and synchronization_count == sessions
-            and final_sync == "SYNC"
-        )
-
-        # --------------------------------------------------------
-        # 7. PRINT TERMINAL REPORT
-        # --------------------------------------------------------
-
-        print()
-
-        print("=" * 76)
-        print("RMLA EXECUTION-TIME BENCHMARK")
-        print("=" * 76)
-
-        print(
-            f"{'Cryptographic Suite':<34}: "
-            "NIST P-256 / SHA-256"
-        )
-
-        print(
-            f"{'Fog Node ID':<34}: {fog_id}"
-        )
-
-        print(
-            f"{'IoT Device ID':<34}: {device_id}"
-        )
-
-        print(
-            f"{'Warm-up Sessions':<34}: {warmup}"
-        )
-
-        print(
-            f"{'Benchmark Sessions':<34}: {sessions}"
-        )
-
-        print(
-            f"{'Database':<34}: In-Memory SQLite"
-        )
-
-        print(
-            f"{'GUI Overhead':<34}: Excluded"
-        )
-
-        print("=" * 76)
-
-        print()
-        print("=" * 76)
-        print("BENCHMARK RESULTS")
-        print("=" * 76)
-
-        print(
-            f"{'System Initialization':<34}: "
-            f"{initialization_ms:.6f} ms"
-        )
-
-        print(
-            f"{'Fog Registration':<34}: "
-            f"{fog_registration_ms:.6f} ms"
-        )
-
-        print(
-            f"{'Device Registration':<34}: "
-            f"{device_registration_ms:.6f} ms"
-        )
-
-        print(
-            f"{'Total Registration':<34}: "
-            f"{total_registration_ms:.6f} ms"
-        )
-
-        print()
-
-        print(
-            f"{'Authentication (Mean)':<34}: "
-            f"{stats['mean']:.6f} ms"
-        )
-
-        print(
-            f"{'Authentication (Min)':<34}: "
-            f"{stats['min']:.6f} ms"
-        )
-
-        print(
-            f"{'Authentication (Max)':<34}: "
-            f"{stats['max']:.6f} ms"
-        )
-
-        print(
-            f"{'Authentication (Median)':<34}: "
-            f"{stats['median']:.6f} ms"
-        )
-
-        print(
-            f"{'Standard Deviation':<34}: "
-            f"{stats['std']:.6f} ms"
-        )
-
-        print()
-
-        print(
-            f"{'Complete Workflow':<34}: "
-            f"{complete_workflow_ms:.6f} ms"
-        )
-
-        print()
-
-        print(
-            f"{'Authentication Result':<34}: "
-            f"{'SUCCESS' if successful_sessions == sessions else 'FAILED'}"
-        )
-
-        print(
-            f"{'Session Key Agreement':<34}: "
-            f"{'VERIFIED' if key_agreement_count == sessions else 'FAILED'}"
-        )
-
-        print(
-            f"{'Mutual Authentication':<34}: "
-            f"{'VERIFIED' if mutual_authentication_verified else 'FAILED'}"
-        )
-
-        print(
-            f"{'Credential Synchronization':<34}: "
-            f"{'VERIFIED' if synchronization_count == sessions else 'FAILED'}"
-        )
-
-        print(
-            f"{'Successful Sessions':<34}: "
-            f"{successful_sessions} / {sessions}"
-        )
-
-        print(
-            f"{'Final Synchronization State':<34}: "
-            f"{final_sync}"
-        )
-
-        print("=" * 76)
-
-        # --------------------------------------------------------
-        # 8. MEASUREMENT NOTES
-        # --------------------------------------------------------
-
-        print()
-        print("Measurement Notes:")
-
-        print(
-            "- Authentication measures the complete Lab.session execution."
-        )
-
-        print(
-            "- It includes Auth_Req, Fog processing, Auth_Rep,"
-        )
-
-        print(
-            "  Device verification, ACK processing, and state synchronization."
-        )
-
-        print(
-            "- Session-key agreement is verified by comparing both keys."
-        )
-
-        print(
-            "- Mutual authentication status is based on successful"
-        )
-
-        print(
-            "  ACK completion, key agreement, and synchronization checks."
-        )
-
-        print(
-            "- GUI rendering and visible log output are excluded."
-        )
-
-        print(
-            "- Warm-up sessions are excluded from timing statistics."
-        )
-
-        print(
-            "- Complete Workflow = Fog registration + Device registration"
-        )
-
-        print(
-            "  + mean authentication time."
-        )
-
-        print(
-            "- These are local implementation execution times,"
-        )
-
-        print(
-            "  not real-network latency measurements."
-        )
-
-        # --------------------------------------------------------
-        # 9. OPTIONAL CSV EXPORT
-        # --------------------------------------------------------
-
-        if csv_path:
-
-            export_csv(
-                csv_path=csv_path,
-                initialization_ms=initialization_ms,
-                fog_registration_ms=fog_registration_ms,
-                device_registration_ms=device_registration_ms,
-                total_registration_ms=total_registration_ms,
-                stats=stats,
-                complete_workflow_ms=complete_workflow_ms,
-                successful_sessions=successful_sessions,
-                key_agreement_count=key_agreement_count,
-                synchronization_count=synchronization_count,
-                samples=authentication_times
-            )
-
-            print()
-            print(
-                f"CSV report saved: {csv_path}"
-            )
-
+        m.H = counted_h
+        m._scalar_mult = counted_scalar_mult
+        m.xor_bytes = counted_xor
+        result = lab.session(device_id, verbose=False)
+        assert_success(result, lab, device_id, "Instrumented profile session")
     finally:
+        m.H = original_h
+        m._scalar_mult = original_scalar_mult
+        m.xor_bytes = original_xor
+        db.close()
+    return counts
 
-        # Always close the database, including when a session fails.
+
+def write_csv(path, metadata, stats, samples, counts):
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["section", "metric", "value", "unit"])
+        for key, value in metadata.items():
+            w.writerow(["configuration", key, value, ""])
+        for key, value in stats.items():
+            w.writerow(["authentication_timing", key, value, "ms"])
+        for key, value in counts.items():
+            w.writerow(["one_session_operation_count", key, value, "calls/session"])
+        w.writerow(["authentication_timing", "session_index", "time_ms", ""])
+        for i, sample in enumerate(samples, 1):
+            w.writerow(["authentication_timing", i, sample, "ms"])
+
+
+def run(args):
+    if args.warmup < 0:
+        raise ValueError("--warmup must be zero or greater.")
+    if args.sessions < 1:
+        raise ValueError("--sessions must be at least 1.")
+
+    m, prototype_path = load_prototype(args.prototype)
+    db, lab = make_lab(m)
+    try:
+        # Initialize and register using the actual v4 classes.
+        t0 = time.perf_counter_ns()
+        lab.initialize()
+        initialization_ms = ns_to_ms(time.perf_counter_ns() - t0)
+
+        t0 = time.perf_counter_ns()
+        lab.add_fog(args.fog)
+        fog_registration_ms = ns_to_ms(time.perf_counter_ns() - t0)
+
+        t0 = time.perf_counter_ns()
+        lab.add_device(args.device, args.fog)
+        device_registration_ms = ns_to_ms(time.perf_counter_ns() - t0)
+
+        registered_sizes = inspect_registered_sizes(m, lab, args.fog, args.device)
+
+        # Warm-up sessions are real protocol sessions but are not timed.
+        for i in range(args.warmup):
+            result = lab.session(args.device, verbose=False)
+            assert_success(result, lab, args.device, f"Warm-up session {i + 1}")
+
+        # Measure complete protocol sessions with no profiling wrappers.
+        samples = []
+        for i in range(args.sessions):
+            start = time.perf_counter_ns()
+            result = lab.session(args.device, verbose=False)
+            elapsed = time.perf_counter_ns() - start
+            assert_success(result, lab, args.device, f"Measured session {i + 1}")
+            samples.append(ns_to_ms(elapsed))
+
+        stats = summarize(samples)
+        final_sync = lab.sync_status(args.device)
+    finally:
         db.close()
 
+    # One separate instrumented session counts actual primitive invocations.
+    operation_counts = count_one_session_operations(m, args.fog, args.device)
 
-# ================================================================
-# COMMAND-LINE INTERFACE
-# ================================================================
+    hash_bits = m.HASH_OUTPUT_BYTES * 8
+    nonce_bits = m.NONCE_BYTES * 8
+    mask_bits = m.MASK_BYTES * 8
+    point_bits = m.ECC_POINT_BYTES * 8
+    coord_bits = m.ECC_COORD_BYTES * 8
+    timestamp_bits = 32  # ts_bytes() in this prototype serializes uint32 seconds.
+
+    # Registration + one mean authentication session; initialization is shown
+    # separately and included only in the explicitly named full-startup metric.
+    registration_ms = fog_registration_ms + device_registration_ms
+    end_to_end_one_session_ms = initialization_ms + registration_ms + stats["mean"]
+
+    metadata = {
+        "prototype_file": str(prototype_path),
+        "curve": "secp160r1 (experimental)",
+        "hash": f"SHA-256 truncated to {hash_bits} bits",
+        "hash_output_bits": hash_bits,
+        "ecc_point_encoding": f"x||y = {point_bits} bits ({m.ECC_POINT_BYTES} bytes)",
+        "ecc_coordinate_bits": coord_bits,
+        "nonce_bits": nonce_bits,
+        "xor_mask_bits": mask_bits,
+        "timestamp": f"unsigned {timestamp_bits}-bit Unix seconds",
+        "timestamp_tolerance_seconds": m.DELTA_T_S,
+        "B_k_bits": registered_sizes["B_k_device"] * 8,
+        "database": "in-memory SQLite",
+        "measurement_scope": "complete local Lab.session() including ACK and synchronization",
+        "network_latency": "not measured",
+        "symmetric_encryption_decryption": "not implemented; prototype uses XOR masking",
+    }
+
+    print("=" * 78)
+    print("RMLA v4 — IMPLEMENTATION-ALIGNED EXECUTION-TIME BENCHMARK")
+    print("=" * 78)
+    print(f"Prototype file                 : {prototype_path.name}")
+    print(f"Curve                           : secp160r1 (experimental)")
+    print(f"Hash                            : SHA-256 / {hash_bits}-bit truncated output")
+    print(f"ECC point encoding              : x||y / {point_bits} bits")
+    print(f"ECC coordinate                  : {coord_bits} bits each")
+    print(f"Protocol nonce                  : {nonce_bits} bits")
+    print(f"XOR mask                        : {mask_bits} bits")
+    print(f"B_k                             : {metadata['B_k_bits']} bits (runtime DB check)")
+    print(f"Timestamp                       : uint{timestamp_bits} Unix seconds")
+    print(f"Timestamp tolerance             : {m.DELTA_T_S} seconds")
+    print("Symmetric SE/SD                 : NOT IMPLEMENTED (XOR masking is used)")
+    print(f"Warm-up sessions                : {args.warmup}")
+    print(f"Measured sessions               : {args.sessions}")
+    print("Database                        : In-memory SQLite")
+    print("GUI/log rendering               : excluded")
+    print("Network latency                 : not measured")
+    print("-" * 78)
+    print("REGISTERED DATABASE FIELD SIZES")
+    for key, value in registered_sizes.items():
+        print(f"{key:<32}: {value * 8:>4} bits ({value} bytes)")
+    print("-" * 78)
+    print("TIMING RESULTS")
+    print(f"System initialization           : {initialization_ms:.6f} ms")
+    print(f"Fog registration                : {fog_registration_ms:.6f} ms")
+    print(f"Device registration             : {device_registration_ms:.6f} ms")
+    print(f"Total registration              : {registration_ms:.6f} ms")
+    print(f"Authentication mean             : {stats['mean']:.6f} ms")
+    print(f"Authentication median           : {stats['median']:.6f} ms")
+    print(f"Authentication standard dev.    : {stats['std']:.6f} ms")
+    print(f"Authentication minimum          : {stats['min']:.6f} ms")
+    print(f"Authentication maximum          : {stats['max']:.6f} ms")
+    print(f"Initialization + registration + one mean session: {end_to_end_one_session_ms:.6f} ms")
+    print("-" * 78)
+    print("ACTUAL PRIMITIVE CALL COUNTS IN ONE AUTHENTICATION SESSION")
+    print(f"H() calls                        : {operation_counts['hash_calls']}")
+    print(f"_scalar_mult() calls              : {operation_counts['scalar_mult_calls']}")
+    print(f"xor_bytes() calls                 : {operation_counts['xor_calls']}")
+    print("Note: profiling counts come from a separate instrumented session;")
+    print("      profiling overhead is not included in timing statistics.")
+    print("-" * 78)
+    print(f"Successful sessions              : {len(samples)} / {args.sessions}")
+    print(f"Mutual authentication             : VERIFIED")
+    print(f"Session-key agreement             : VERIFIED")
+    print(f"ACK + credential synchronization  : {final_sync}")
+    print("=" * 78)
+    print("Interpretation:")
+    print("* Authentication time is the full local Lab.session() path:")
+    print("  Auth_Req, Fog verification/response, Device verification, ACK,")
+    print("  and the prototype's credential-state update.")
+    print("* The prototype does not implement a symmetric SE/SD primitive;")
+    print("  XOR masking must not be reported as AES or symmetric encryption.")
+    print("* The reported timings are implementation execution times, not")
+    print("  network latency and not the paper's assumed per-primitive constants.")
+
+    if args.csv:
+        write_csv(args.csv, metadata, stats, samples, operation_counts)
+        print(f"CSV saved                         : {args.csv}")
+
 
 def main():
-
     parser = argparse.ArgumentParser(
-        description="RMLA Execution-Time Benchmark"
+        description="Benchmark the exact current RMLA Laboratory v4 implementation."
     )
-
-    parser.add_argument(
-        "--warmup",
-        type=int,
-        default=DEFAULT_WARMUP
-    )
-
-    parser.add_argument(
-        "--sessions",
-        type=int,
-        default=DEFAULT_SESSIONS
-    )
-
-    parser.add_argument(
-        "--fog",
-        type=str,
-        default=DEFAULT_FOG_ID
-    )
-
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=DEFAULT_DEVICE_ID
-    )
-
-    parser.add_argument(
-        "--csv",
-        type=str,
-        default=None,
-        help="Optional CSV output file."
-    )
-
+    parser.add_argument("--prototype", default=DEFAULT_PROTOTYPE,
+                        help=f"prototype Python file (default: {DEFAULT_PROTOTYPE})")
+    parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
+    parser.add_argument("--sessions", type=int, default=DEFAULT_SESSIONS)
+    parser.add_argument("--fog", default=DEFAULT_FOG_ID)
+    parser.add_argument("--device", default=DEFAULT_DEVICE_ID)
+    parser.add_argument("--csv", default=None, help="optional CSV output path")
     args = parser.parse_args()
-
     try:
-
-        run_benchmark(
-            warmup=args.warmup,
-            sessions=args.sessions,
-            fog_id=args.fog,
-            device_id=args.device,
-            csv_path=args.csv
-        )
-
-    except (ValueError, RuntimeError) as exc:
-
-        print(
-            f"\nBENCHMARK ERROR: {exc}",
-            file=sys.stderr
-        )
-
+        run(args)
+    except (ValueError, RuntimeError, ImportError, FileNotFoundError) as exc:
+        print(f"BENCHMARK ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1)
 
 
-# ================================================================
-# ENTRY POINT
-# ================================================================
-
 if __name__ == "__main__":
-
     main()
