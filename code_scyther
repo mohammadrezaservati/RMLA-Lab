@@ -1,4 +1,66 @@
 
+/*
+ * ============================================================
+ * RMLA Protocol - Formal Verification Model (Scyther)
+ * ============================================================
+ *
+ * Description:
+ * This file contains the Scyther specification of the RMLA
+ * (Resilient Lightweight Mutual Authentication) protocol,
+ * designed for secure communication between an IoT device
+ * and a Fog node in WBAN-assisted fog computing environments.
+ *
+ * Protocol Participants:
+ *   1. Device: Represents an IoT device initiating authentication.
+ *   2. Fog: Represents the Fog node responsible for verifying
+ *      the device and establishing a shared session key.
+ *
+ * Protocol Phases:
+ *   1. Device Authentication Request:
+ *      The device generates fresh nonces and an ephemeral
+ *      ECC public value, then computes its temporary identity,
+ *      authentication message, and masked nonce.
+ *
+ *   2. Fog Authentication Response:
+ *      The Fog node verifies the device's authentication data,
+ *      generates its own fresh nonces and ECC public value,
+ *      and derives the session key.
+ *
+ *   3. Mutual Authentication and Key Confirmation:
+ *      The device verifies the Fog node's response, derives
+ *      the session key, and sends an acknowledgment message.
+ *      The Fog node verifies the acknowledgment.
+ *
+ * Cryptographic Components:
+ *   - H: Symbolic hash function.
+ *   - ECC: Symbolic elliptic-curve operation.
+ *   - xor: XOR-based masking operation.
+ *   - con: Concatenation function.
+ *
+ * Security Claims:
+ *   - Secrecy of device-side nonces.
+ *   - Secrecy of Fog-side nonces.
+ *   - Aliveness.
+ *   - Weak agreement.
+ *   - Non-injective synchronization.
+ *
+ * Modeling Notes:
+ *   This specification focuses on the symbolic authentication
+ *   and key-establishment message exchanges between the Device
+ *   and Fog roles. Registration Authority operations, numerical
+ *   timestamp validation, and credential-state recovery are
+ *   outside the scope of this model.
+ *
+ *   ECC operations are represented symbolically in this model.
+ *   The declaration of ECC as a hash function does not by itself
+ *   encode the algebraic Diffie-Hellman property.
+ *
+ * Tool:
+ *   Scyther - Automatic Verification of Security Protocols
+ *
+ * ============================================================
+ */
+
 hashfunction H;
 hashfunction ECC;
 
