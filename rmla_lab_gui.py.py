@@ -1,10 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+RMLA Laboratory Prototype (v3 - 32-bit timestamps)
 ==============================
+
 Functional prototype of the RMLA mutual-authentication / key-agreement
-protocol (IoT device <-> fog node, with a trusted RA)
-Requirements:  pip install cryptography      (tkinter ships with Python)
+protocol (IoT device <-> fog node, with a trusted RA).
+
+What is different from v1
+-------------------------
+* RA, Fog and Device are separate classes. Each one touches only its own
+  tables and only sees the *messages* it receives (no shared local variables).
+* Messages are serialised to bytes ("wire") and parsed again, so an entity can
+  never read the other side's memory.
+* The fog finds the device record from the TID_d carried in Auth_Req.
+* Many fog nodes / many devices are supported.
+* Desynchronisation recovery is really implemented:
+    - fog keeps (current, candidate) state per device,
+    - candidate is activated only after a valid ACK, or when the next
+      Auth_Req is authenticated with the candidate identity (ACK was lost),
+    - device commits only after G_f is verified and keeps the previous state.
+* Fog has a replay cache (a replayed Auth_Req could otherwise overwrite a
+  pending candidate and cause a permanent desync).
+* Failure simulation: lose Auth_Rep, lose ACK, stale timestamp, tampered
+  Auth_Req, replayed Auth_Req.
+* Automated self-test suite (also: `python rmla_lab.py --selftest`).
+* Hash inputs are length-prefixed (unambiguous concatenation).
+
+Requirements: Python standard library only (tkinter ships with Python)
 """
 
 import csv
@@ -18,8 +41,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec
 
 try:
     import tkinter as tk
@@ -33,11 +54,26 @@ except ImportError:          # headless use (self-tests only)
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "RMLA_Laboratory_v2.db"
-SCHEMA_VERSION = 2
+DB_PATH = BASE_DIR / "RMLA_Laboratory_v3_32bit_timestamp.db"
+SCHEMA_VERSION = 4  # new database/schema profile for 32-bit-second timestamps
 
-CURVE = ec.SECP256R1()
-DELTA_T_MS = 60_000          # allowed timestamp skew: 60 s
+# Experimental profile matching the paper's nominal output sizes.
+HASH_OUTPUT_BYTES = 20       # 160-bit hash output
+NONCE_BYTES = 16              # 128-bit protocol nonces
+MASK_BYTES = 16               # 128-bit XOR mask
+DELTA_T_S = 60                # allowed timestamp skew: 60 seconds
+
+# SEC 2 secp160r1 domain parameters. This is an experimental, legacy-size
+# curve and MUST NOT be used for production security.
+ECC_P = int("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF7FFFFFFF", 16)
+ECC_A = int("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF7FFFFFFC", 16)
+ECC_B = int("1C97BEFC54BD7A8B65ACF89F81D4D4ADC565FA45", 16)
+ECC_GX = int("4A96B5688EF573284664698968C38BB913CBFC82", 16)
+ECC_GY = int("23A628553168947D59DCC912042351377AC5FB32", 16)
+ECC_N = int("0100000000000000000001F4C8F927AED3CA752257", 16)
+ECC_G = (ECC_GX, ECC_GY)
+ECC_COORD_BYTES = 20
+ECC_POINT_BYTES = 2 * ECC_COORD_BYTES  # x || y = 320 bits, no SEC1 prefix
 
 
 class ProtocolError(Exception):
@@ -61,17 +97,23 @@ def _enc(value):
 
 
 def H(*values):
-    """SHA-256 over length-prefixed inputs (no ambiguity in concatenation)."""
+    """SHA-256 with a 160-bit truncated digest and length-prefixed inputs."""
     h = hashlib.sha256()
-    for v in values:
-        b = _enc(v)
+    for value in values:
+        b = _enc(value)
         h.update(len(b).to_bytes(4, "big"))
         h.update(b)
-    return h.digest()
+    return h.digest()[:HASH_OUTPUT_BYTES]
+
+
+def H_mask(*values):
+    """Return a 128-bit mask for XOR with 128-bit protocol nonces."""
+    return H(*values)[:MASK_BYTES]
 
 
 def random_nonce():
-    return secrets.token_bytes(32)
+    """Generate a cryptographically secure 128-bit protocol nonce."""
+    return secrets.token_bytes(NONCE_BYTES)
 
 
 def xor_bytes(a, b):
@@ -80,31 +122,101 @@ def xor_bytes(a, b):
     return bytes(x ^ y for x, y in zip(a, b))
 
 
-def now_ms():
-    return int(time.time() * 1000)
+def xor_tid_nonce(tid, nonce):
+    """XOR a 128-bit nonce with a 160-bit TID using zero-extension.
+
+    The same fixed-width encoding is used by Device and Fog.
+    """
+    if len(nonce) != NONCE_BYTES or len(tid) != HASH_OUTPUT_BYTES:
+        raise ProtocolError("invalid TID/nonce length")
+    return xor_bytes(tid, nonce + b"\x00" * (HASH_OUTPUT_BYTES - NONCE_BYTES))
 
 
-def ts_bytes(ms):
-    return int(ms).to_bytes(8, "big", signed=True)
+def now_s():
+    """Current Unix timestamp in whole seconds (32-bit wire representation)."""
+    return int(time.time())
 
 
-def encode_point(public_key):
-    return public_key.public_bytes(
-        serialization.Encoding.X962,
-        serialization.PublicFormat.UncompressedPoint,
-    )
+def ts_bytes(timestamp_s):
+    """Encode a Unix timestamp as an unsigned 32-bit integer (4 bytes)."""
+    value = int(timestamp_s)
+    if not 0 <= value <= 0xFFFFFFFF:
+        raise ProtocolError("timestamp is outside the unsigned 32-bit range")
+    return value.to_bytes(4, "big", signed=False)
+
+
+def _point_add(p1, p2):
+    """Affine point addition on secp160r1; None represents point at infinity."""
+    if p1 is None:
+        return p2
+    if p2 is None:
+        return p1
+    x1, y1 = p1
+    x2, y2 = p2
+    if x1 == x2 and (y1 + y2) % ECC_P == 0:
+        return None
+    if p1 == p2:
+        if y1 % ECC_P == 0:
+            return None
+        slope = ((3 * x1 * x1 + ECC_A) * pow(2 * y1, -1, ECC_P)) % ECC_P
+    else:
+        slope = ((y2 - y1) * pow((x2 - x1) % ECC_P, -1, ECC_P)) % ECC_P
+    x3 = (slope * slope - x1 - x2) % ECC_P
+    y3 = (slope * (x1 - x3) - y1) % ECC_P
+    return x3, y3
+
+
+def _scalar_mult(k, point=ECC_G):
+    if not isinstance(k, int) or k < 0:
+        raise ValueError("ECC scalar must be a non-negative integer")
+    result = None
+    addend = point
+    while k:
+        if k & 1:
+            result = _point_add(result, addend)
+        addend = _point_add(addend, addend)
+        k >>= 1
+    return result
+
+
+# Validate the secp160r1 base point and subgroup order at module load.
+assert _scalar_mult(ECC_N, ECC_G) is None and \
+       (ECC_GY**2 - (ECC_GX**3 + ECC_A*ECC_GX + ECC_B)) % ECC_P == 0
+
+
+def generate_ecc_private_key():
+    """Uniform private scalar in [1, n-1] for the experimental curve."""
+    return secrets.randbelow(ECC_N - 1) + 1
+
+
+def encode_point(point):
+    """Encode a secp160r1 point as x||y (40 bytes = 320 bits)."""
+    if point is None:
+        raise ProtocolError("cannot encode point at infinity")
+    x, y = point
+    return x.to_bytes(ECC_COORD_BYTES, "big") + y.to_bytes(ECC_COORD_BYTES, "big")
 
 
 def decode_point(data):
-    try:
-        return ec.EllipticCurvePublicKey.from_encoded_point(CURVE, data)
-    except ValueError:
-        raise ProtocolError("invalid elliptic-curve point")
+    """Decode and validate the laboratory's 40-byte x||y point encoding."""
+    if not isinstance(data, bytes) or len(data) != ECC_POINT_BYTES:
+        raise ProtocolError("invalid elliptic-curve point length")
+    x = int.from_bytes(data[:ECC_COORD_BYTES], "big")
+    y = int.from_bytes(data[ECC_COORD_BYTES:], "big")
+    if x >= ECC_P or y >= ECC_P:
+        raise ProtocolError("invalid elliptic-curve point coordinates")
+    if (y * y - (x * x * x + ECC_A * x + ECC_B)) % ECC_P != 0:
+        raise ProtocolError("point is not on secp160r1")
+    # secp160r1 has cofactor 1; on-curve validation is sufficient.
+    return (x, y)
 
 
 def ecdh(private_key, public_key):
-    return private_key.exchange(ec.ECDH(), public_key)
-
+    """Return the 160-bit x-coordinate of the ECDH shared point."""
+    shared = _scalar_mult(private_key, public_key)
+    if shared is None:
+        raise ProtocolError("invalid ECDH shared point")
+    return shared[0].to_bytes(ECC_COORD_BYTES, "big")
 
 def hx(value, n=12):
     return value.hex()[:n] + "..."
@@ -150,9 +262,9 @@ def require(msg, spec):
             raise ProtocolError(f"malformed message: {field} size")
 
 
-REQ_SPEC = {"TID_d": 32, "T_d": None, "E_d": 32, "G_d": 32, "I": 65}
-REP_SPEC = {"TID_f": 32, "T_f": None, "E_f": 32, "G_f": 32, "J": 65}
-ACK_SPEC = {"TID_d": 32, "Ack": 32}
+REQ_SPEC = {"TID_d": 20, "T_d": None, "E_d": 16, "G_d": 20, "I": 40}
+REP_SPEC = {"TID_f": 20, "T_f": None, "E_f": 16, "G_f": 20, "J": 40}
+ACK_SPEC = {"TID_d": 20, "Ack": 20}
 
 
 # ============================================================
@@ -233,13 +345,14 @@ class RA:
 
     def initialize(self):
         self.db.reset()
-        K = secrets.token_bytes(32)
+        K = secrets.token_bytes(HASH_OUTPUT_BYTES)
         self.db.conn.execute(
             "INSERT INTO system_config VALUES (1, ?, ?, ?)",
-            ("NIST P-256 / secp256r1", "SHA-256", K))
+            ("secp160r1 (experimental)", "SHA-256/160-bit-truncated", K))
         self.db.conn.commit()
-        self.log("[RA] Curve selected: NIST P-256 (public parameters P_ECC).")
-        self.log("[RA] Hash function selected: SHA-256.")
+        self.log("[RA] Curve selected: secp160r1 (experimental; x||y = 320 bits).")
+        self.log("[RA] Hash function: SHA-256 truncated to 160 bits.")
+        self.log("[RA] Protocol nonces: 128 bits.")
         self.log("[RA] Master secret K generated and kept only by the RA.")
         self.log("[RA] B_k is generated independently of K (not derived).")
 
@@ -251,7 +364,7 @@ class RA:
         if self.db.conn.execute(
                 "SELECT 1 FROM ra_fog WHERE fog_id=?", (fog_id,)).fetchone():
             raise LabError(f"Fog node '{fog_id}' is already registered.")
-        tid_f = random_nonce()
+        tid_f = secrets.token_bytes(HASH_OUTPUT_BYTES)
         self.db.conn.execute(
             "INSERT INTO ra_fog VALUES (?, ?, ?)", (fog_id, tid_f, a_f))
         self.db.conn.commit()
@@ -267,13 +380,13 @@ class RA:
             "SELECT * FROM ra_fog WHERE fog_id=?", (fog_id,)).fetchone()
         if fog is None:
             raise LabError(f"Fog node '{fog_id}' is not registered.")
-        tid_d = random_nonce()
-        b_k = secrets.token_bytes(32)          # B_k <-$ {0,1}^256
+        tid_d = secrets.token_bytes(HASH_OUTPUT_BYTES)
+        b_k = secrets.token_bytes(HASH_OUTPUT_BYTES)  # independent 160-bit B_k (protocol credential)
         self.db.conn.execute(
             "INSERT INTO ra_device VALUES (?, ?, ?, ?, ?)",
             (device_id, fog_id, tid_d, a_d, b_k))
         self.db.conn.commit()
-        self.log("[RA] TID_d assigned; random 256-bit B_k generated.")
+        self.log("[RA] TID_d assigned; independent random 160-bit B_k generated.")
         self.log("[RA] (A_d, TID_d, B_k) stored.")
         return {"TID_d": tid_d, "B_k": b_k,
                 "TID_f": fog["tid_f"], "A_f": fog["a_f"]}
@@ -333,7 +446,7 @@ class Fog:
         return None
 
     def _purge(self, now):
-        limit = 2 * DELTA_T_MS
+        limit = 2 * DELTA_T_S
         self.replay = {k: t for k, t in self.replay.items()
                        if now - t <= limit}
 
@@ -342,9 +455,9 @@ class Fog:
         log = self.log
         require(req, REQ_SPEC)
         node = self._node()
-        now, td = now_ms(), req["T_d"]
+        now, td = now_s(), req["T_d"]
 
-        if abs(now - td) > DELTA_T_MS:
+        if abs(now - td) > DELTA_T_S:
             raise ProtocolError(
                 "Auth_Req rejected: timestamp not fresh (|T_f - T_d| > dT)")
         log("[Fog] Timestamp freshness verified.")
@@ -367,8 +480,8 @@ class Fog:
         a_d, a_f = row["a_d"], node["a_f"]
         td_b = ts_bytes(td)
 
-        rd = xor_bytes(req["E_d"], H(b_k, a_f, td_b))
-        tid_d_new = H(xor_bytes(tid_d, rd))
+        rd = xor_bytes(req["E_d"], H_mask(b_k, a_f, td_b))
+        tid_d_new = H(xor_tid_nonce(tid_d, rd))
         gd_star = H(a_d, tid_d_new, b_k, td_b, req["I"])
         if not hmac.compare_digest(gd_star, req["G_d"]):
             raise ProtocolError("Auth_Req rejected: G_d verification failed")
@@ -382,13 +495,13 @@ class Fog:
                 "already uses the candidate state -> candidate promoted "
                 "(synchronisation recovered).", "warn")
 
-        tf = now_ms()
+        tf = now_s()
         tf_b = ts_bytes(tf)
         rf = random_nonce()
-        rg = ec.generate_private_key(CURVE)       # r_g in Z_n^*
-        J = encode_point(rg.public_key())          # J = r_g . P
-        ef = xor_bytes(rf, H(tid_d_new, b_k))
-        tid_f_new = H(xor_bytes(tid_f, rf))
+        rg = generate_ecc_private_key()              # r_g in Z_n^*
+        J = encode_point(_scalar_mult(rg))          # J = r_g . P
+        ef = xor_bytes(rf, H_mask(tid_d_new, b_k))
+        tid_f_new = H(xor_tid_nonce(tid_f, rf))
         shared = ecdh(rg, device_pub)              # r_g . I
         sk = H(shared, rd, rf, tf_b, b_k)
         gf = H(tid_f_new, b_k, rf, sk, tf_b, ef)
@@ -473,18 +586,18 @@ class Device:
             (self.device_id,)).fetchone()
 
     # ---------------- step 1 ----------------
-    def make_request(self, ts_offset_ms=0):
+    def make_request(self, ts_offset_s=0):
         row = self._row()
         a_d, a_f = row["a_d"], row["a_f"]
         tid_d, b_k = row["tid_d"], row["b_k"]
 
-        td = now_ms() + ts_offset_ms
+        td = now_s() + int(ts_offset_s)
         td_b = ts_bytes(td)
         rd = random_nonce()
-        re = ec.generate_private_key(CURVE)          # r_e in Z_n^*
-        I = encode_point(re.public_key())             # I = r_e . P
-        ed = xor_bytes(rd, H(b_k, a_f, td_b))
-        tid_d_new = H(xor_bytes(tid_d, rd))
+        re = generate_ecc_private_key()                 # r_e in Z_n^*
+        I = encode_point(_scalar_mult(re))             # I = r_e . P
+        ed = xor_bytes(rd, H_mask(b_k, a_f, td_b))
+        tid_d_new = H(xor_tid_nonce(tid_d, rd))
         gd = H(a_d, tid_d_new, b_k, td_b, I)
 
         self.ctx = {"tid_d": tid_d, "rd": rd, "re": re,
@@ -504,7 +617,7 @@ class Device:
         ctx, row = self.ctx, self._row()
         if ctx["tid_d"] != row["tid_d"]:
             raise ProtocolError("Auth_Rep rejected: stale request context")
-        if abs(now_ms() - rep["T_f"]) > DELTA_T_MS:
+        if abs(now_s() - rep["T_f"]) > DELTA_T_S:
             raise ProtocolError("Auth_Rep rejected: timestamp not fresh")
         if rep["TID_f"] != row["tid_f"]:
             raise ProtocolError("Auth_Rep rejected: unexpected TID_f")
@@ -512,11 +625,11 @@ class Device:
 
         b_k, tid_f = row["b_k"], row["tid_f"]
         tf_b = ts_bytes(rep["T_f"])
-        rf = xor_bytes(rep["E_f"], H(ctx["tid_d_new"], b_k))
+        rf = xor_bytes(rep["E_f"], H_mask(ctx["tid_d_new"], b_k))
         fog_pub = decode_point(rep["J"])
         shared = ecdh(ctx["re"], fog_pub)             # r_e . J
         sk = H(shared, ctx["rd"], rf, tf_b, b_k)
-        tid_f_new = H(xor_bytes(tid_f, rf))
+        tid_f_new = H(xor_tid_nonce(tid_f, rf))
         gf_star = H(tid_f_new, b_k, rf, sk, tf_b, rep["E_f"])
         if not hmac.compare_digest(gf_star, rep["G_f"]):
             raise ProtocolError("Auth_Rep rejected: G_f verification failed")
@@ -634,7 +747,7 @@ class Lab:
                          f"({device_id} <-> {dev.fog_id})")
 
         # 1. device -> fog : Auth_Req
-        req = dev.make_request(-120_000 if stale else 0)
+        req = dev.make_request(-120 if stale else 0)
         self.captured[device_id] = to_wire(req)          # eavesdropper copy
         if tamper:
             req = dict(req)
@@ -818,6 +931,19 @@ def run_self_tests(log):
     log("AUTOMATED SELF-TESTS (isolated in-memory database)", "sec")
     log("=" * 72, "sec")
 
+    # T0: verify the concrete field sizes claimed by the paper's table.
+    field_device = lab.device("DEV-1")
+    field_req = field_device.make_request()
+    field_sizes_ok = (
+        len(field_req["G_d"]) * 8 == 160
+        and len(field_req["I"]) * 8 == 320
+        and len(field_req["E_d"]) * 8 == 128
+        and len(ts_bytes(field_req["T_d"])) * 8 == 32
+    )
+    check("T0  request field sizes match the paper's parameter table",
+          field_sizes_ok)
+    field_device.abort()
+
     # T1 -------------------------------------------------------
     r = lab.session("DEV-1", verbose=False)
     check("T1  normal session: both parties authenticated, ACK accepted",
@@ -948,7 +1074,7 @@ class RMLAApp:
         self.build_ui()
 
         self.log("RMLA Laboratory Prototype started.", "sec")
-        self.log("Curve: NIST P-256   |   Hash: SHA-256")
+        self.log("Curve: secp160r1 (320-bit x||y) | Hash: SHA-256/160 | Nonces: 128-bit")
         self.log("1) Press 'Registration'   2) Press 'Authentication'")
 
     # ---------------------------------------------------- layout
