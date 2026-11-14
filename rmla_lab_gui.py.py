@@ -1,32 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RMLA Laboratory Prototype (v2)
 ==============================
-
 Functional prototype of the RMLA mutual-authentication / key-agreement
-protocol (IoT device <-> fog node, with a trusted RA).
-
-What is different from v1
--------------------------
-* RA, Fog and Device are separate classes. Each one touches only its own
-  tables and only sees the *messages* it receives (no shared local variables).
-* Messages are serialised to bytes ("wire") and parsed again, so an entity can
-  never read the other side's memory.
-* The fog finds the device record from the TID_d carried in Auth_Req.
-* Many fog nodes / many devices are supported.
-* Desynchronisation recovery is really implemented:
-    - fog keeps (current, candidate) state per device,
-    - candidate is activated only after a valid ACK, or when the next
-      Auth_Req is authenticated with the candidate identity (ACK was lost),
-    - device commits only after G_f is verified and keeps the previous state.
-* Fog has a replay cache (a replayed Auth_Req could otherwise overwrite a
-  pending candidate and cause a permanent desync).
-* Failure simulation: lose Auth_Rep, lose ACK, stale timestamp, tampered
-  Auth_Req, replayed Auth_Req.
-* Automated self-test suite (also: `python rmla_lab.py --selftest`).
-* Hash inputs are length-prefixed (unambiguous concatenation).
-
+protocol (IoT device <-> fog node, with a trusted RA)
 Requirements:  pip install cryptography      (tkinter ships with Python)
 """
 
